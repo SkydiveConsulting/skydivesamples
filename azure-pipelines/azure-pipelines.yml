@@ -1,0 +1,147 @@
+# Azure Synapse artifacts: validate + deploy with Deploy-SynapseArtifacts.ps1 (Az.Synapse only)
+#
+# Assumed repo layout (adjust the parameters below to match):
+#   <repo>/synapse/                          Synapse Git root folder (linkedService/, pipeline/, notebook/, ...)
+#   <repo>/powershell/Deploy-SynapseArtifacts.ps1
+#   <repo>/overrides/dev.json, test.json, prod.json
+#
+# Flow:
+#   Build      : validate the artifacts against every environment's overrides file (no Azure connection),
+#                then publish the folder, the script and the overrides as pipeline artifact "synapse".
+#   Deploy_<x> : one deployment stage per environment, in the order listed under "environments".
+#                Each runs AzurePowerShell@5 on its own (Workload Identity Federation) service connection.
+#                Approvals / checks are configured on the Azure DevOps environment, not in this file.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - synapse/*
+      - powershell/Deploy-SynapseArtifacts.ps1
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - synapse/*
+      - powershell/Deploy-SynapseArtifacts.ps1
+
+parameters:
+  - name: environments
+    type: object
+    default:
+      - name: dev
+        adoEnvironment: synapse-dev          # Azure DevOps environment (approvals/checks live here)
+        serviceConnection: sc-synapse-dev    # WIF service connection
+        workspaceName: synw-skydivesample1-dev
+        deleteNotInSource: true
+      - name: test
+        adoEnvironment: synapse-test
+        serviceConnection: sc-synapse-test
+        workspaceName: synw-skydivesample1-test
+        deleteNotInSource: true
+      - name: prod
+        adoEnvironment: synapse-prod
+        serviceConnection: sc-synapse-prod
+        workspaceName: synw-skydivesample1-prod
+        deleteNotInSource: false
+
+variables:
+  artifactName: SynapseArtifact
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # ------------------------------------------------------------------------------
+  # Build: validate + publish
+  # ------------------------------------------------------------------------------
+  - stage: Build
+    displayName: Validate Synapse artifacts
+    jobs:
+      - job: Validate
+        displayName: Validate and publish
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - ${{ each env in parameters.environments }}:
+              - task: PowerShell@2
+                displayName: Validate (${{ env.name }} overrides)
+                inputs:
+                  pwsh: true
+                  targetType: filePath
+                  filePath: $(Build.SourcesDirectory)/powershell/Deploy-SynapseArtifacts.ps1
+                  arguments: >-
+                    -RootFolder '$(Build.SourcesDirectory)/synapse'
+                    -OverridesFile '$(Build.SourcesDirectory)/synapse/overrides/${{ env.name }}.json'
+                    -ValidateOnly
+
+          - task: CopyFiles@2
+            displayName: Stage Synapse folder
+            inputs:
+              SourceFolder: $(Build.SourcesDirectory)/synapse
+              Contents: '**'
+              TargetFolder: $(Build.ArtifactStagingDirectory)/workspace
+
+          - task: CopyFiles@2
+            displayName: Stage overrides
+            inputs:
+              SourceFolder: $(Build.SourcesDirectory)/synapse/overrides
+              Contents: '*.json'
+              TargetFolder: $(Build.ArtifactStagingDirectory)/overrides
+
+          - task: CopyFiles@2
+            displayName: Stage deploy script
+            inputs:
+              SourceFolder: $(Build.SourcesDirectory)
+              Contents: powershell/Deploy-SynapseArtifacts.ps1
+              TargetFolder: $(Build.ArtifactStagingDirectory)
+              flattenFolders: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish artifact
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: $(artifactName)
+
+  # ------------------------------------------------------------------------------
+  # Deploy: one stage per environment, sequential, main branch only (not on PRs)
+  # ------------------------------------------------------------------------------
+  - ${{ each env in parameters.environments }}:
+      - stage: Deploy_${{ env.name }}
+        displayName: Deploy to ${{ env.name }}
+        condition: >-
+          and(
+            succeeded(),
+            eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+            ne(variables['Build.Reason'], 'PullRequest')
+          )
+        jobs:
+          - deployment: Deploy
+            displayName: Deploy Synapse artifacts (${{ env.workspaceName }})
+            environment: ${{ env.adoEnvironment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - download: current
+                      artifact: $(artifactName)
+
+                    - task: AzurePowerShell@5
+                      displayName: Deploy Synapse artifacts
+                      inputs:
+                        azureSubscription: ${{ env.serviceConnection }}
+                        azurePowerShellVersion: LatestVersion
+                        pwsh: true
+                        ScriptType: FilePath
+                        ScriptPath: $(Build.SourcesDirectory)/powershell/Deploy-SynapseArtifacts.ps1
+                        ScriptArguments: >-
+                          -RootFolder '$(Pipeline.Workspace)/$(artifactName)/workspace'
+                          -WorkspaceName '${{ env.workspaceName }}'
+                          -OverridesFile '$(Pipeline.Workspace)/$(artifactName)/overrides/${{ env.name }}.json'
+                          -DeleteNotInSource:$${{ env.deleteNotInSource }}
