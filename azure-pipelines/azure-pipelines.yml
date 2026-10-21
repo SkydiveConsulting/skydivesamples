@@ -2,8 +2,8 @@
 #
 # Assumed repo layout (adjust the parameters below to match):
 #   <repo>/synapse/                          Synapse Git root folder (linkedService/, pipeline/, notebook/, ...)
+#   <repo>/synapse/overrides/dev.json, test.json, prod.json
 #   <repo>/powershell/Deploy-SynapseArtifacts.ps1
-#   <repo>/overrides/dev.json, test.json, prod.json
 #
 # Flow:
 #   Build      : validate the artifacts against every environment's overrides file (no Azure connection),
@@ -39,16 +39,19 @@ parameters:
         serviceConnection: sc-synapse-dev    # WIF service connection
         workspaceName: synw-skydivesample1-dev
         deleteNotInSource: true
+        deployManagedPrivateEndpoints: false   # true only if managedPrivateEndpoint/ files are in the repo
       - name: test
         adoEnvironment: synapse-test
         serviceConnection: sc-synapse-test
         workspaceName: synw-skydivesample1-test
         deleteNotInSource: true
+        deployManagedPrivateEndpoints: false   # true only if managedPrivateEndpoint/ files are in the repo
       - name: prod
         adoEnvironment: synapse-prod
         serviceConnection: sc-synapse-prod
         workspaceName: synw-skydivesample1-prod
         deleteNotInSource: false
+        deployManagedPrivateEndpoints: false   # true only if managedPrivateEndpoint/ files are in the repo
 
 variables:
   artifactName: SynapseArtifact
@@ -93,7 +96,7 @@ stages:
             inputs:
               SourceFolder: $(Build.SourcesDirectory)/synapse/overrides
               Contents: '*.json'
-              TargetFolder: $(Build.ArtifactStagingDirectory)/overrides
+              TargetFolder: $(Build.ArtifactStagingDirectory)/synapse/overrides
 
           - task: CopyFiles@2
             displayName: Stage deploy script
@@ -143,5 +146,6 @@ stages:
                         ScriptArguments: >-
                           -RootFolder '$(Pipeline.Workspace)/$(artifactName)/workspace'
                           -WorkspaceName '${{ env.workspaceName }}'
-                          -OverridesFile '$(Pipeline.Workspace)/$(artifactName)/overrides/${{ env.name }}.json'
+                          -OverridesFile '$(Pipeline.Workspace)/$(artifactName)/synapse/overrides/${{ env.name }}.json'
                           -DeleteNotInSource:$${{ env.deleteNotInSource }}
+                          -DeployManagedPrivateEndpoints:$${{ env.deployManagedPrivateEndpoints }}
