@@ -27,6 +27,9 @@
                      4. start triggers whose runtimeState is "Started" in source,
                         plus any running trigger outside source that was stopped in step 1
 
+    -DryRun        : as Deploy, but only reads the workspace and logs each change
+                     (prefixed "[DryRun]") without making it.
+
     Managed private endpoints (managedVirtualNetwork/<vnet>/managedPrivateEndpoint/*.json):
       * always validated; deployed only with -DeployManagedPrivateEndpoints
       * endpoints the workspace creates itself (names starting "synapse-ws-") are
@@ -43,6 +46,10 @@
 .PARAMETER DeployManagedPrivateEndpoints
     Create managed private endpoints from managedVirtualNetwork/. With
     -DeleteNotInSource, also removes endpoints not in source (except "synapse-ws-*").
+
+.PARAMETER DryRun
+    Connect to the workspace and log what would be stopped, created, updated,
+    deleted and started, without changing anything.
 #>
 [CmdletBinding()]
 param(
@@ -50,7 +57,8 @@ param(
     [string] $WorkspaceName,
     [switch] $ValidateOnly,
     [switch] $DeleteNotInSource,
-    [switch] $DeployManagedPrivateEndpoints
+    [switch] $DeployManagedPrivateEndpoints,
+    [switch] $DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -287,6 +295,10 @@ if ($ValidateOnly) { return }
 if (-not $WorkspaceName) { throw '-WorkspaceName is required unless -ValidateOnly is set.' }
 Import-Module Az.Synapse
 
+# With -DryRun the workspace is only read; every change is logged with this prefix and skipped
+$DryRunPrefix = if ($DryRun) { '[DryRun] ' } else { '' }
+if ($DryRun) { Write-Host "Dry run against '$WorkspaceName': no changes will be made." }
+
 $tempDir = Join-Path ([IO.Path]::GetTempPath()) "synapse-deploy-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 
@@ -341,7 +353,8 @@ if ($DeployManagedPrivateEndpoints) {
                 else { Write-Host "Managed private endpoint $($mpe.Name) already exists" }
                 continue
             }
-            Write-Host "Creating managed private endpoint $($mpe.Name) (managed VNet '$vnet')"
+            Write-Host "${DryRunPrefix}Creating managed private endpoint $($mpe.Name) (managed VNet '$vnet')"
+            if ($DryRun) { continue }
             New-AzSynapseManagedPrivateEndpoint -WorkspaceName $WorkspaceName -VirtualNetworkName $vnet `
                 -Name $mpe.Name -DefinitionFile $mpe.Path -Confirm:$false | Out-Null
         }
@@ -359,8 +372,8 @@ foreach ($folder in $DeployOrder) {
 $restartOutsideSource = [System.Collections.Generic.List[string]]::new()
 foreach ($t in @(Get-AzSynapseTrigger -WorkspaceName $WorkspaceName)) {
     if ((Get-TriggerRuntimeState $t) -ne 'Started') { continue }
-    Write-Host "Stopping trigger $($t.Name)"
-    Stop-AzSynapseTrigger -WorkspaceName $WorkspaceName -Name $t.Name -Confirm:$false
+    Write-Host "${DryRunPrefix}Stopping trigger $($t.Name)"
+    if (-not $DryRun) { Stop-AzSynapseTrigger -WorkspaceName $WorkspaceName -Name $t.Name -Confirm:$false }
     if (-not $sourceNames.trigger.Contains($t.Name) -and -not $DeleteNotInSource) {
         $restartOutsideSource.Add($t.Name)
     }
@@ -369,7 +382,8 @@ foreach ($t in @(Get-AzSynapseTrigger -WorkspaceName $WorkspaceName)) {
 # 3b. Create / update
 foreach ($folder in $DeployOrder) {
     foreach ($item in $sorted[$folder]) {
-        Write-Host "Deploying $folder/$($item.Name)"
+        Write-Host "${DryRunPrefix}Deploying $folder/$($item.Name)"
+        if ($DryRun) { continue }
         $common = @{ WorkspaceName = $WorkspaceName; Name = $item.Name; Confirm = $false }
 
         switch ($folder) {
@@ -446,6 +460,10 @@ if ($DeleteNotInSource) {
             if ($existing.Name -match $ProtectedNamePattern) { continue }
             $pending.Add($existing.Name)
         }
+        if ($DryRun) {
+            foreach ($name in $pending) { Write-Host "${DryRunPrefix}Removing $folder/$name" }
+            continue
+        }
         for ($pass = 1; $pending.Count -gt 0 -and $pass -le 5; $pass++) {
             $failed = [System.Collections.Generic.List[string]]::new()
             foreach ($name in $pending) {
@@ -474,7 +492,8 @@ if ($DeleteNotInSource) {
             foreach ($m in @($mpeArtifacts | Where-Object VirtualNetwork -eq $vnet)) { [void]$inSource.Add($m.Name) }
             foreach ($e in @(Get-AzSynapseManagedPrivateEndpoint -WorkspaceName $WorkspaceName -VirtualNetworkName $vnet)) {
                 if ($inSource.Contains($e.Name) -or $e.Name -match $WorkspaceMpePattern) { continue }
-                Write-Host "Removing $MpeFolder/$($e.Name) (managed VNet '$vnet')"
+                Write-Host "${DryRunPrefix}Removing $MpeFolder/$($e.Name) (managed VNet '$vnet')"
+                if ($DryRun) { continue }
                 Remove-AzSynapseManagedPrivateEndpoint -WorkspaceName $WorkspaceName -VirtualNetworkName $vnet `
                     -Name $e.Name -Force -Confirm:$false | Out-Null
             }
@@ -489,9 +508,10 @@ foreach ($t in $sorted.trigger) {
 }
 $toStart.AddRange($restartOutsideSource)
 foreach ($name in $toStart) {
-    Write-Host "Starting trigger $name"
-    Start-AzSynapseTrigger -WorkspaceName $WorkspaceName -Name $name | Out-Null
+    Write-Host "${DryRunPrefix}Starting trigger $name"
+    if (-not $DryRun) { Start-AzSynapseTrigger -WorkspaceName $WorkspaceName -Name $name | Out-Null }
 }
 
 Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "Deployment to '$WorkspaceName' completed."
+if ($DryRun) { Write-Host "Dry run against '$WorkspaceName' completed; no changes were made." }
+else { Write-Host "Deployment to '$WorkspaceName' completed." }

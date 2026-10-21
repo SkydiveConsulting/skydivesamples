@@ -10,6 +10,8 @@
 #   Deploy_<x> : one deployment stage per environment, in the order listed under "environments".
 #                Each runs AzurePowerShell@5 on its own (Workload Identity Federation) service connection.
 #                Approvals / checks are configured on the Azure DevOps environment, not in this file.
+#   dryRun     : tick "Dry run" when queuing a run manually; the Deploy stages then only read each
+#                workspace and log what would change, without deploying anything.
 
 trigger:
   branches:
@@ -30,6 +32,11 @@ pr:
       - powershell/Deploy-SynapseArtifacts.ps1
 
 parameters:
+  - name: dryRun
+    displayName: Dry run (log deploy actions without changing the workspaces)
+    type: boolean
+    default: false
+
   - name: environments
     type: object
     default:
@@ -107,7 +114,10 @@ stages:
   # ------------------------------------------------------------------------------
   - ${{ each env in parameters.environments }}:
       - stage: Deploy_${{ env.name }}
-        displayName: Deploy to ${{ env.name }}
+        ${{ if parameters.dryRun }}:
+          displayName: Deploy to ${{ env.name }} (dry run)
+        ${{ else }}:
+          displayName: Deploy to ${{ env.name }}
         condition: >-
           and(
             succeeded(),
@@ -138,3 +148,4 @@ stages:
                           -WorkspaceName '${{ env.workspaceName }}'
                           -DeleteNotInSource:$${{ env.deleteNotInSource }}
                           -DeployManagedPrivateEndpoints:$${{ env.deployManagedPrivateEndpoints }}
+                          -DryRun:$${{ parameters.dryRun }}
