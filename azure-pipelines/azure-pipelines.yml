@@ -2,12 +2,11 @@
 #
 # Assumed repo layout (adjust the parameters below to match):
 #   <repo>/synapse/                          Synapse Git root folder (linkedService/, pipeline/, notebook/, ...)
-#   <repo>/synapse/overrides/dev.json, test.json, prod.json
 #   <repo>/powershell/Deploy-SynapseArtifacts.ps1
 #
 # Flow:
-#   Build      : validate the artifacts against every environment's overrides file (no Azure connection),
-#                then publish the folder, the script and the overrides as pipeline artifact "synapse".
+#   Build      : validate the artifacts (no Azure connection),
+#                then publish the folder and the script as pipeline artifact "SynapseArtifact".
 #   Deploy_<x> : one deployment stage per environment, in the order listed under "environments".
 #                Each runs AzurePowerShell@5 on its own (Workload Identity Federation) service connection.
 #                Approvals / checks are configured on the Azure DevOps environment, not in this file.
@@ -72,17 +71,15 @@ stages:
           - checkout: self
             fetchDepth: 1
 
-          - ${{ each env in parameters.environments }}:
-              - task: PowerShell@2
-                displayName: Validate (${{ env.name }} overrides)
-                inputs:
-                  pwsh: true
-                  targetType: filePath
-                  filePath: $(Build.SourcesDirectory)/powershell/Deploy-SynapseArtifacts.ps1
-                  arguments: >-
-                    -RootFolder '$(Build.SourcesDirectory)/synapse'
-                    -OverridesFile '$(Build.SourcesDirectory)/synapse/overrides/${{ env.name }}.json'
-                    -ValidateOnly
+          - task: PowerShell@2
+            displayName: Validate Synapse artifacts
+            inputs:
+              pwsh: true
+              targetType: filePath
+              filePath: $(Build.SourcesDirectory)/powershell/Deploy-SynapseArtifacts.ps1
+              arguments: >-
+                -RootFolder '$(Build.SourcesDirectory)/synapse'
+                -ValidateOnly
 
           - task: CopyFiles@2
             displayName: Stage Synapse folder
@@ -90,13 +87,6 @@ stages:
               SourceFolder: $(Build.SourcesDirectory)/synapse
               Contents: '**'
               TargetFolder: $(Build.ArtifactStagingDirectory)/workspace
-
-          - task: CopyFiles@2
-            displayName: Stage overrides
-            inputs:
-              SourceFolder: $(Build.SourcesDirectory)/synapse/overrides
-              Contents: '*.json'
-              TargetFolder: $(Build.ArtifactStagingDirectory)/synapse/overrides
 
           - task: CopyFiles@2
             displayName: Stage deploy script
@@ -142,10 +132,9 @@ stages:
                         azurePowerShellVersion: LatestVersion
                         pwsh: true
                         ScriptType: FilePath
-                        ScriptPath: $(Build.SourcesDirectory)/powershell/Deploy-SynapseArtifacts.ps1
+                        ScriptPath: $(Pipeline.Workspace)/$(artifactName)/Deploy-SynapseArtifacts.ps1
                         ScriptArguments: >-
                           -RootFolder '$(Pipeline.Workspace)/$(artifactName)/workspace'
                           -WorkspaceName '${{ env.workspaceName }}'
-                          -OverridesFile '$(Pipeline.Workspace)/$(artifactName)/synapse/overrides/${{ env.name }}.json'
                           -DeleteNotInSource:$${{ env.deleteNotInSource }}
                           -DeployManagedPrivateEndpoints:$${{ env.deployManagedPrivateEndpoints }}

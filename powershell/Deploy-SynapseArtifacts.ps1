@@ -13,8 +13,6 @@
                        Pipeline, Notebook, SparkJobDefinition, IntegrationRuntime,
                        Credential) resolves to a file in the repo
                      * no circular references within a type
-                     * every path in the overrides file exists
-
                      * managed private endpoints have privateLinkResourceId + groupId
 
     Deploy (default): run inside AzurePowerShell@5 (WIF service connection).
@@ -42,15 +40,6 @@
     VNet itself, Spark pools, KQL scripts, Spark configurations, lake databases.
     Manage those in Terraform or extend this script.
 
-.PARAMETER OverridesFile
-    Per-environment JSON file. Keys are "<folder>/<artifactName>", values map a
-    dot-separated property path to the new value. Numeric segments index arrays.
-    {
-      "linkedService/LS_KeyVault": { "properties.typeProperties.baseUrl": "https://kv-prod.vault.azure.net/" },
-      "trigger/TR_Daily":          { "properties.runtimeState": "Started" },
-      "managedPrivateEndpoint/MPE_Storage": { "properties.privateLinkResourceId": "/subscriptions/.../storageAccounts/stprod" }
-    }
-
 .PARAMETER DeployManagedPrivateEndpoints
     Create managed private endpoints from managedVirtualNetwork/. With
     -DeleteNotInSource, also removes endpoints not in source (except "synapse-ws-*").
@@ -59,7 +48,6 @@
 param(
     [Parameter(Mandatory)] [string] $RootFolder,
     [string] $WorkspaceName,
-    [string] $OverridesFile,
     [switch] $ValidateOnly,
     [switch] $DeleteNotInSource,
     [switch] $DeployManagedPrivateEndpoints
@@ -102,8 +90,8 @@ $WorkspaceMpePattern = '^synapse-ws-'
 $ExecutorSizeByCores = @{ 4 = 'Small'; 8 = 'Medium'; 16 = 'Large'; 32 = 'XLarge'; 64 = 'XXLarge' }
 
 # PowerShell 7.5+ can keep date strings as strings; older versions convert them to
-# DateTime, which can change trigger start times when re-serialised. Unmodified
-# files are therefore always deployed from the original file.
+# DateTime, which changes them when re-serialised. Artifacts are deployed from the
+# original file; only notebooks are re-serialised (to .ipynb).
 $JsonReadArgs = @{ Depth = 100 }
 if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $JsonReadArgs.DateKind = 'String' }
 
@@ -149,25 +137,6 @@ function Get-JsonChild($Node, [string] $Segment) {
         if ($p) { return , $p.Value }
     }
     return $null
-}
-
-function Set-JsonPath($Object, [string] $Path, $Value) {
-    $segments = $Path -split '\.'
-    $current = $Object
-    for ($i = 0; $i -lt $segments.Count - 1; $i++) {
-        $current = Get-JsonChild $current $segments[$i]
-        if ($null -eq $current) { throw "segment '$($segments[$i])' not found" }
-    }
-    $last = $segments[-1]
-    if ($current -is [System.Collections.IList] -and $last -match '^\d+$') {
-        if ([int]$last -ge $current.Count) { throw "index $last out of range" }
-        $current[[int]$last] = $Value
-    }
-    elseif ($current -is [System.Management.Automation.PSCustomObject]) {
-        if ($current.PSObject.Properties[$last]) { $current.$last = $Value }
-        else { $current | Add-Member -NotePropertyName $last -NotePropertyValue $Value }
-    }
-    else { throw "parent of '$last' is not an object or array" }
 }
 
 # --------------------------------------------------------------------------------
@@ -231,7 +200,6 @@ function Import-ArtifactFolder {
             Name           = [string]$json.name
             Path           = $file.FullName
             Json           = $json
-            Modified       = $false
             Refs           = @()
             VirtualNetwork = $VirtualNetwork
         })
@@ -268,27 +236,7 @@ $index = @{}   # "folder/name" -> artifact (case-insensitive)
 foreach ($a in $artifacts) { $index["$($a.Folder)/$($a.Name)"] = $a }
 
 # --------------------------------------------------------------------------------
-# 2. Overrides
-# --------------------------------------------------------------------------------
-if ($OverridesFile) {
-    try   { $overrides = Get-Content -Raw -Path $OverridesFile | ConvertFrom-Json @JsonReadArgs }
-    catch { throw "Overrides file '$OverridesFile' could not be read: $($_.Exception.Message)" }
-
-    foreach ($entry in $overrides.PSObject.Properties) {
-        $target = $index[$entry.Name]
-        if (-not $target) { Add-ValidationError "Override target '$($entry.Name)' not found in source"; continue }
-        foreach ($setting in $entry.Value.PSObject.Properties) {
-            try {
-                Set-JsonPath $target.Json $setting.Name $setting.Value
-                $target.Modified = $true
-            }
-            catch { Add-ValidationError "Override '$($entry.Name)' -> '$($setting.Name)': $($_.Exception.Message)" }
-        }
-    }
-}
-
-# --------------------------------------------------------------------------------
-# 3. Reference validation
+# 2. Reference validation
 # --------------------------------------------------------------------------------
 foreach ($a in $artifacts) {
     $acc = [System.Collections.Generic.List[object]]::new()
@@ -334,7 +282,7 @@ if ($mpeCount) {
 if ($ValidateOnly) { return }
 
 # --------------------------------------------------------------------------------
-# 4. Deploy
+# 3. Deploy
 # --------------------------------------------------------------------------------
 if (-not $WorkspaceName) { throw '-WorkspaceName is required unless -ValidateOnly is set.' }
 Import-Module Az.Synapse
@@ -342,12 +290,6 @@ Import-Module Az.Synapse
 $tempDir = Join-Path ([IO.Path]::GetTempPath()) "synapse-deploy-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 
-function Get-DeployFile($Item) {
-    if (-not $Item.Modified) { return $Item.Path }
-    $out = Join-Path $tempDir "$($Item.Folder)__$($Item.Name).json"
-    $Item.Json | ConvertTo-Json -Depth 100 | Set-Content -Path $out -Encoding utf8NoBOM
-    return $out
-}
 function Get-FolderPath($Item) {
     $f = Get-JsonChild $Item.Json.properties 'folder'
     if ($f) { return [string](Get-JsonChild $f 'name') }
@@ -378,7 +320,7 @@ $mpeArtifacts = @($artifacts | Where-Object Folder -eq $MpeFolder)
 $mpeVnets = @($mpeArtifacts | ForEach-Object VirtualNetwork | Sort-Object -Unique)
 if (-not $mpeVnets) { $mpeVnets = @('default') }
 
-# 4-0. Managed private endpoints (create missing ones only)
+# 3-0. Managed private endpoints (create missing ones only)
 if ($DeployManagedPrivateEndpoints) {
     foreach ($vnet in $mpeVnets) {
         $existing = @{}
@@ -401,7 +343,7 @@ if ($DeployManagedPrivateEndpoints) {
             }
             Write-Host "Creating managed private endpoint $($mpe.Name) (managed VNet '$vnet')"
             New-AzSynapseManagedPrivateEndpoint -WorkspaceName $WorkspaceName -VirtualNetworkName $vnet `
-                -Name $mpe.Name -DefinitionFile (Get-DeployFile $mpe) -Confirm:$false | Out-Null
+                -Name $mpe.Name -DefinitionFile $mpe.Path -Confirm:$false | Out-Null
         }
     }
 }
@@ -413,7 +355,7 @@ foreach ($folder in $DeployOrder) {
     $sourceNames[$folder] = $set
 }
 
-# 4a. Stop running triggers
+# 3a. Stop running triggers
 $restartOutsideSource = [System.Collections.Generic.List[string]]::new()
 foreach ($t in @(Get-AzSynapseTrigger -WorkspaceName $WorkspaceName)) {
     if ((Get-TriggerRuntimeState $t) -ne 'Started') { continue }
@@ -424,23 +366,23 @@ foreach ($t in @(Get-AzSynapseTrigger -WorkspaceName $WorkspaceName)) {
     }
 }
 
-# 4b. Create / update
+# 3b. Create / update
 foreach ($folder in $DeployOrder) {
     foreach ($item in $sorted[$folder]) {
         Write-Host "Deploying $folder/$($item.Name)"
         $common = @{ WorkspaceName = $WorkspaceName; Name = $item.Name; Confirm = $false }
 
         switch ($folder) {
-            'linkedService' { Set-AzSynapseLinkedService @common -DefinitionFile (Get-DeployFile $item) | Out-Null }
-            'dataset'       { Set-AzSynapseDataset       @common -DefinitionFile (Get-DeployFile $item) | Out-Null }
-            'dataflow'      { Set-AzSynapseDataFlow      @common -DefinitionFile (Get-DeployFile $item) | Out-Null }
-            'pipeline'      { Set-AzSynapsePipeline      @common -DefinitionFile (Get-DeployFile $item) | Out-Null }
-            'trigger'       { Set-AzSynapseTrigger       @common -DefinitionFile (Get-DeployFile $item) | Out-Null }
+            'linkedService' { Set-AzSynapseLinkedService @common -DefinitionFile $item.Path | Out-Null }
+            'dataset'       { Set-AzSynapseDataset       @common -DefinitionFile $item.Path | Out-Null }
+            'dataflow'      { Set-AzSynapseDataFlow      @common -DefinitionFile $item.Path | Out-Null }
+            'pipeline'      { Set-AzSynapsePipeline      @common -DefinitionFile $item.Path | Out-Null }
+            'trigger'       { Set-AzSynapseTrigger       @common -DefinitionFile $item.Path | Out-Null }
 
             'sparkJobDefinition' {
                 $args_ = $common.Clone()
                 $fp = Get-FolderPath $item; if ($fp) { $args_.FolderPath = $fp }
-                Set-AzSynapseSparkJobDefinition @args_ -DefinitionFile (Get-DeployFile $item) | Out-Null
+                Set-AzSynapseSparkJobDefinition @args_ -DefinitionFile $item.Path | Out-Null
             }
 
             'notebook' {
@@ -494,7 +436,7 @@ foreach ($folder in $DeployOrder) {
     }
 }
 
-# 4c. Delete artifacts not in source (dependents first; retry for intra-type dependencies)
+# 3c. Delete artifacts not in source (dependents first; retry for intra-type dependencies)
 if ($DeleteNotInSource) {
     foreach ($folder in $GetRemoveCmdlets.Keys) {
         $get, $remove = $GetRemoveCmdlets[$folder]
@@ -540,7 +482,7 @@ if ($DeleteNotInSource) {
     }
 }
 
-# 4d. Start triggers
+# 3d. Start triggers
 $toStart = [System.Collections.Generic.List[string]]::new()
 foreach ($t in $sorted.trigger) {
     if ((Get-JsonChild $t.Json.properties 'runtimeState') -eq 'Started') { $toStart.Add($t.Name) }
