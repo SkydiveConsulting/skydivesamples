@@ -1,5 +1,5 @@
 # skydivesamples
-Skydive Consulting sample code snippets - free for use by anyone
+Skydive Consulting sample code snippets
 
 ## Samples
 
